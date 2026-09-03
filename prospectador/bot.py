@@ -3,32 +3,50 @@ import json
 import asyncio
 import random
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DAILY_GOAL = int(os.getenv("DAILY_GOAL", "40"))
 DATA_FILE = Path("prospectador/leads.json")
-USER_AGENT = "Meta20KProspectador/2.1 (business lead discovery)"
+USER_AGENT = "Meta20KProspectador/2.2 (business lead discovery)"
+OVERPASS_SERVERS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+]
 SEGMENTS = {"Barbearia":["hairdresser"],"Salão de beleza":["beauty"],"Restaurante":["restaurant"],"Lanchonete":["fast_food"],"Oficina mecânica":["car_repair"],"Clínica":["clinic","doctors"],"Dentista":["dentist"],"Academia":["fitness_centre"],"Pet shop":["pet"],"Loja de móveis":["furniture"],"Mercado":["supermarket","convenience"],"Climatização":["hvac"]}
-MENU = ReplyKeyboardMarkup([["🔎 Buscar 10","🚀 Buscar 40"],["📊 Status","📋 Leads"]], resize_keyboard=True, is_persistent=True)
-DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+MENU = ReplyKeyboardMarkup([["🔎 Buscar 10","🚀 Buscar 40"],["📊 Status","📋 Leads"]],resize_keyboard=True,is_persistent=True)
+DATA_FILE.parent.mkdir(parents=True,exist_ok=True)
 if not DATA_FILE.exists(): DATA_FILE.write_text("[]",encoding="utf-8")
+
 def load_leads():
     try:return json.loads(DATA_FILE.read_text(encoding="utf-8"))
     except:return []
 def save_leads(x):DATA_FILE.write_text(json.dumps(x,ensure_ascii=False,indent=2),encoding="utf-8")
-def http_json(url,data=None):
+def http_json(url,data=None,timeout=40):
     req=Request(url,data=data,headers={"User-Agent":USER_AGENT,"Accept":"application/json"})
-    with urlopen(req,timeout=40) as r:return json.loads(r.read().decode())
+    with urlopen(req,timeout=timeout) as r:return json.loads(r.read().decode())
 def geocode(city):
-    q=urlencode({"q":f"{city}, Brasil","format":"jsonv2","limit":1,"countrycodes":"br"});r=http_json("https://nominatim.openstreetmap.org/search?"+q)
+    q=urlencode({"q":f"{city}, Brasil","format":"jsonv2","limit":1,"countrycodes":"br"})
+    r=http_json("https://nominatim.openstreetmap.org/search?"+q)
     if not r:return None
     b=r[0]["boundingbox"];return float(b[0]),float(b[2]),float(b[1]),float(b[3])
+def overpass_json(query):
+    payload=urlencode({"data":query}).encode();last=None
+    for server in OVERPASS_SERVERS:
+        try:return http_json(server,payload,45),server
+        except HTTPError as e:
+            last=e
+            if e.code in (429,502,503,504): time.sleep(2);continue
+        except (URLError,TimeoutError,OSError) as e:last=e;continue
+    raise last or RuntimeError("Nenhum servidor de busca respondeu")
 def clean_phone(p):
     n=re.sub(r"\D","",p or "")
     if n.startswith("00"):n=n[2:]
@@ -50,21 +68,22 @@ def message(name,segment,city):
     return f"Olá! Tudo bem? Encontrei a {name} pesquisando empresas de {city}. Trabalho com soluções digitais para negócios como o seu, incluindo {offer_for(segment)}.\n\n🎁 Para novos clientes: 50% de desconto no primeiro serviço e nenhum pagamento antecipado. Primeiro desenvolvemos e entregamos o serviço combinado; o pagamento é feito depois da entrega conforme o acordado.\n\nPosso fazer uma análise inicial do negócio e mostrar uma ideia prática, sem compromisso?"
 def search_varied(city):
     bbox=geocode(city)
-    if not bbox:return []
+    if not bbox:return [],""
     s,w,n,e=bbox;parts=[];tm={}
     for label,vals in SEGMENTS.items():
         for v in vals:
             tm[v]=label
             for key in ("shop","amenity","leisure","craft"):parts.append(f'nwr["{key}"="{v}"]({s},{w},{n},{e});')
-    q='[out:json][timeout:30];('+''.join(parts)+');out center tags;';data=http_json("https://overpass-api.de/api/interpreter",urlencode({"data":q}).encode());rows=[]
+    q='[out:json][timeout:30];('+''.join(parts)+');out center tags;'
+    data,server=overpass_json(q);rows=[]
     for el in data.get("elements",[]):
         t=el.get("tags",{});name=t.get("name")
         if not name:continue
-        raw=t.get("contact:whatsapp") or t.get("whatsapp") or t.get("contact:phone") or t.get("phone") or t.get("contact:mobile") or "";phone=clean_phone(raw);kind=t.get("shop") or t.get("amenity") or t.get("leisure") or t.get("craft") or ""
+        raw=t.get("contact:whatsapp") or t.get("whatsapp") or t.get("contact:phone") or t.get("phone") or t.get("contact:mobile") or ""
+        phone=clean_phone(raw);kind=t.get("shop") or t.get("amenity") or t.get("leisure") or t.get("craft") or ""
         rows.append({"name":name,"phone":phone,"website":t.get("contact:website") or t.get("website") or t.get("contact:instagram") or "","segment":tm.get(kind,"Comércio local"),"osm_id":f'{el.get("type")}:{el.get("id")}'})
-    random.shuffle(rows);rows.sort(key=lambda x:bool(x["phone"]),reverse=True);return rows
-async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🚀 META 20K PROSPECTADOR\n\nMeta diária: {DAILY_GOAL} novos leads\n\nUse os botões abaixo ou os comandos do menu.",reply_markup=MENU)
+    random.shuffle(rows);rows.sort(key=lambda x:bool(x["phone"]),reverse=True);return rows,server
+async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):await update.message.reply_text(f"🚀 META 20K PROSPECTADOR\n\nMeta diária: {DAILY_GOAL} novos leads\n\nUse os botões abaixo ou os comandos do menu.",reply_markup=MENU)
 async def meta(update:Update,context:ContextTypes.DEFAULT_TYPE):await update.message.reply_text(f"🎯 Meta diária: {DAILY_GOAL} leads",reply_markup=MENU)
 async def status(update:Update,context:ContextTypes.DEFAULT_TYPE):
     leads=load_leads();today=datetime.now().strftime("%Y-%m-%d");c=sum(x.get("date")==today for x in leads);await update.message.reply_text(f"📊 META 20K\nMeta: {DAILY_GOAL}\nLeads hoje: {c}\nFaltam: {max(0,DAILY_GOAL-c)}\nTotal CRM: {len(leads)}",reply_markup=MENU)
@@ -72,8 +91,8 @@ async def leads_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE):
     leads=load_leads();txt="📋 ÚLTIMOS LEADS\n\n"+"\n".join(f"• {x['name']} — {x.get('segment','')}" for x in leads[-10:]);await update.message.reply_text(txt if leads else "Nenhum lead ainda.",reply_markup=MENU)
 async def do_search(update,city,qty):
     await update.message.reply_text(f"🔎 Buscando {qty} novos clientes variados em {city}...",reply_markup=MENU)
-    try:found=await asyncio.to_thread(search_varied,city)
-    except Exception as e:await update.message.reply_text(f"⚠️ Busca indisponível agora ({type(e).__name__}).",reply_markup=MENU);return
+    try:found,server=await asyncio.to_thread(search_varied,city)
+    except Exception as e:await update.message.reply_text(f"⚠️ As fontes de busca não responderam agora ({type(e).__name__}). Tente novamente em alguns instantes.",reply_markup=MENU);return
     leads=load_leads();known={x.get("osm_id") for x in leads};candidates=[x for x in found if x["osm_id"] not in known];buckets={}
     for x in candidates:buckets.setdefault(x["segment"],[]).append(x)
     fresh=[]
@@ -98,8 +117,7 @@ async def text_menu(update:Update,context:ContextTypes.DEFAULT_TYPE):
     elif t=="🚀 Buscar 40":await do_search(update,"Porto Velho",40)
     elif t=="📊 Status":await status(update,context)
     elif t=="📋 Leads":await leads_cmd(update,context)
-async def post_init(app):
-    await app.bot.set_my_commands([BotCommand("buscar","Buscar clientes: /buscar Porto Velho 10"),BotCommand("status","Ver meta do dia"),BotCommand("leads","Ver últimos leads"),BotCommand("meta","Ver meta diária"),BotCommand("start","Abrir painel")])
+async def post_init(app):await app.bot.set_my_commands([BotCommand("buscar","Buscar clientes: /buscar Porto Velho 10"),BotCommand("status","Ver meta do dia"),BotCommand("leads","Ver últimos leads"),BotCommand("meta","Ver meta diária"),BotCommand("start","Abrir painel")])
 def main():
     if not TOKEN:raise RuntimeError("Configure TELEGRAM_BOT_TOKEN")
     from telegram.ext import MessageHandler,filters
